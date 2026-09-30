@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     from loglens.detection.embeddings import EmbeddingEngine
     from loglens.detection.grouping import group_anomalies
     from loglens.detection.ingestion import AsyncCommandReader, CommandError, stream_lines
-    from loglens.detection.parser import detect_format, parse_line
+    from loglens.detection.parser import parse_line, sniff_format
     from loglens.detection.speedbench import bench_file, to_markdown
     from loglens.detection.templates import TemplateRegistry
     from loglens.detection.turbo import scan_file as turbo_scan
@@ -73,7 +73,7 @@ def _load():
         CommandError,
         stream_lines,
     )
-    from loglens.detection.parser import detect_format, parse_line  # noqa: F401
+    from loglens.detection.parser import parse_line, sniff_format  # noqa: F401
     from loglens.detection.speedbench import bench_file, to_markdown  # noqa: F401
     from loglens.detection.templates import TemplateRegistry  # noqa: F401
     from loglens.detection.turbo import scan_file as turbo_scan  # noqa: F401
@@ -130,22 +130,129 @@ _FAIL_ON_RANK = {
 }
 
 
+# Severities that, on their own, indicate a real incident.
+_INCIDENT_CRIT_LEVELS = {"EMERGENCY", "ALERT", "FATAL", "CRITICAL"}
+_INCIDENT_SEVERE_RATIO = 0.30  # fraction of parsed lines that are severe → burst
+_INCIDENT_BURST_FAMILIES = 5  # this many critical families → clear burst
+
+
+def _assess_incident(
+    items: list[dict[str, Any]], lines_parsed: int
+) -> tuple[bool, float, list[str]]:
+    crit = [it for it in items if str(it.get("level", "")).upper() in _INCIDENT_CRIT_LEVELS]
+    errs = [it for it in items if str(it.get("level", "")).upper() in ("ERROR",)]
+    severe_lines = sum(int(it.get("count", 1) or 1) for it in (*crit, *errs))
+    ratio = (severe_lines / lines_parsed) if lines_parsed else 0.0
+    max_score = max((float(it.get("score", 0) or 0) for it in items), default=0.0)
+
+    incident = False
+    score = 0.0
+    reasons: list[str] = []
+    if crit:
+        incident = True
+        reasons.append(
+            f"{len(crit)} critical/fatal anomaly famil{'y' if len(crit) == 1 else 'ies'}"
+        )
+        score = max(score, min(1.0, 0.6 + 0.04 * len(crit)))
+    if ratio >= _INCIDENT_SEVERE_RATIO:
+        incident = True
+        reasons.append(f"{ratio * 100:.0f}% of parsed lines are severe (burst)")
+        score = max(score, min(1.0, 0.3 + ratio))
+    if len(crit) >= _INCIDENT_BURST_FAMILIES:
+        reasons.append(f"burst of {len(crit)} critical families")
+        score = max(score, 0.85)
+    if incident:
+        score = max(score, max_score)
+    return incident, round(min(1.0, score), 4), reasons
+
+
+def _template_id(template: str) -> str:
+    """Stable short id for a template/family, so tooling can join across runs."""
+    import hashlib
+
+    return hashlib.sha1((template or "").encode("utf-8")).hexdigest()[:12]
+
+
+async def _collect_entries(
+    source: str, sniff_n: int = 500
+) -> tuple[list[Any], int, str, float, dict[str, Any]]:
+    line_count = 0
+    entries: list[Any] = []
+    sample_buf: list[str] = []
+    fmt: str | None = None
+    confidence = 0.0
+    layout: dict[str, Any] = {}
+
+    async for line in stream_lines(source):
+        line_count += 1
+        if fmt is None:
+            sample_buf.append(line)
+            if len(sample_buf) >= sniff_n:
+                fmt, confidence, layout = sniff_format(sample_buf)
+                for buffered in sample_buf:
+                    e = parse_line(buffered, fmt, layout)
+                    if e is not None:
+                        entries.append(e)
+                sample_buf = []
+            continue
+        e = parse_line(line, fmt, layout)
+        if e is not None:
+            entries.append(e)
+
+    if fmt is None:
+        fmt, confidence, layout = sniff_format(sample_buf)
+        for buffered in sample_buf:
+            e = parse_line(buffered, fmt, layout)
+            if e is not None:
+                entries.append(e)
+
+    return entries, line_count, fmt or "PLAINTEXT", confidence, layout
+
+
+def _family_item(g, members: list, line_of: dict[int, int]) -> dict[str, Any]:
+    line_numbers = sorted(line_of[id(m)] for m in members if id(m) in line_of)
+    timestamps = [m.timestamp for m in members if getattr(m, "timestamp", "")]
+    samples = [(getattr(m, "raw", "") or m.message) for m in members[:3]]
+    tid = _template_id(getattr(g, "template", "") or g.sample)
+    return {
+        "id": tid,
+        "template_id": tid,
+        "template": getattr(g, "template", ""),
+        "level": g.level,
+        "service": g.service,
+        "score": round(g.max_score, 4),
+        "count": g.count,
+        "first_seen": (min(timestamps) if timestamps else None),
+        "last_seen": (max(timestamps) if timestamps else None),
+        "line_numbers": line_numbers[:1000],  # capped; count carries the true total
+        "sample_lines": samples,
+        "message": g.sample,
+        "calibrated_p": None,  # populated once conformal calibration lands (P3.G)
+        "reasons": list(getattr(g, "reasons", []) or []),
+        "detector_votes": {},  # populated once the ensemble lands (P3.F)
+    }
+
+
 def _emit_json(
     source: str,
     mode: str,
     lines_read: int | None,
     lines_parsed: int,
-    incident: bool,
+    incident: bool,  # kept for signature stability; recomputed from items below
     items: list[dict[str, Any]],
 ) -> None:
     """Print a machine-readable analysis result to stdout (for CI/CD)."""
+    is_incident, incident_score, incident_reasons = _assess_incident(items, lines_parsed)
     payload = {
+        "schema": "loglens.v1",
         "version": __version__,
         "source": source,
         "mode": mode,
         "lines_read": lines_read,
         "lines_parsed": lines_parsed,
-        "incident": incident,
+        "incident": is_incident,
+        "incident_score": incident_score,
+        "incident_reasons": incident_reasons,
         "anomaly_count": len(items),
         "anomalies": items,
     }
@@ -442,18 +549,20 @@ def analyze(
                 f"(redundancy [green]{res.redundancy() * 100:.1f}%[/green])"
             )
             anomalies = res.anomalies()
-            severe = sum(
-                1
-                for a in anomalies
-                if a.level.upper() in ("EMERGENCY", "FATAL", "CRITICAL", "ERROR")
-            )
-            incident_flag = ""
-            if res.parsed_lines and severe / res.parsed_lines >= 0.30:
-                incident_flag = " [bold red blink]⚠ INCIDENT[/bold red blink]"
+            _assess_items = [
+                {"level": a.level, "count": a.count, "score": a.score} for a in anomalies
+            ]
+            is_incident, inc_score, inc_reasons = _assess_incident(_assess_items, res.parsed_lines)
+            incident_flag = " [bold red blink]⚠ INCIDENT[/bold red blink]" if is_incident else ""
             console.print(
                 f"[bold cyan][LogLens][/bold cyan] Anomalies: "
                 f"[bold red]{len(anomalies):,}[/bold red] 🚨{incident_flag}"
             )
+            if is_incident:
+                console.print(
+                    f"[bold red][LogLens][/bold red] Incident score: "
+                    f"[bold]{inc_score:.2f}[/bold] [dim]— {'; '.join(inc_reasons)}[/dim]"
+                )
             console.print(
                 "[dim]      (turbo is a fast unsupervised scan — counts differ from the "
                 "default supervised model by design; drop --turbo for the model's verdict)[/dim]"
@@ -515,41 +624,36 @@ def analyze(
             # --- machine-readable output + CI/CD gating ---
             turbo_items = [
                 {
+                    "id": _template_id(getattr(a, "template", "") or a.sample),
+                    "template_id": _template_id(getattr(a, "template", "") or a.sample),
+                    "template": getattr(a, "template", ""),
                     "level": a.level,
                     "service": a.service,
-                    "score": a.score,
+                    "score": round(a.score, 4),
                     "count": a.count,
+                    "first_seen": None,
+                    "last_seen": None,
+                    "line_numbers": [],
+                    "sample_lines": [a.sample],
                     "message": a.sample,
-                    "reasons": a.reasons,
+                    "calibrated_p": None,
+                    "reasons": list(a.reasons or []),
+                    "detector_votes": {},
                 }
                 for a in anomalies
             ]
-            turbo_incident = bool(res.parsed_lines and severe / res.parsed_lines >= 0.30)
             if as_json:
-                _emit_json(source, "turbo", None, res.parsed_lines, turbo_incident, turbo_items)
+                _emit_json(source, "turbo", None, res.parsed_lines, False, turbo_items)
             _apply_fail_on(fail_on, turbo_items)
             return  # turbo done — skip the classic pipeline
 
-        line_count = 0
-        fmt = None
-        sample_entry = None
-        entries = []
-
         console.print(f"\n[bold cyan][LogLens][/bold cyan] Source: [yellow]{source}[/yellow]")
-        async for line in stream_lines(source):
-            line_count += 1
-            if line_count == 1:
-                fmt = detect_format(line)
-                console.print(
-                    f"[bold cyan][LogLens][/bold cyan] Detected format: [yellow]{fmt}[/yellow]"
-                )
-
-            entry = parse_line(line, fmt)
-            if entry:
-                if sample_entry is None:
-                    sample_entry = entry
-                entries.append(entry)
-
+        entries, line_count, fmt, fmt_conf, _layout = await _collect_entries(source)
+        sample_entry = entries[0] if entries else None
+        console.print(
+            f"[bold cyan][LogLens][/bold cyan] Detected format: [yellow]{fmt}[/yellow] "
+            f"[dim](confidence {fmt_conf:.0%})[/dim]"
+        )
         console.print(
             f"[bold cyan][LogLens][/bold cyan] Lines: [bold]{line_count:,}[/bold] read "
             f"→ [bold]{len(entries):,}[/bold] parsed"
@@ -686,14 +790,15 @@ def analyze(
         # Use len(anomalies) — actual score-flagged count, not just noise points
         n_anomalies = len(anomalies)
         incident_flag = ""
+        inc_score = 0.0
+        inc_reasons: list[str] = []
         if n_anomalies > 0:
-            severe = sum(
-                1
+            _assess_items = [
+                {"level": a.level, "count": 1, "score": getattr(a, "anomaly_score", 0.0)}
                 for a in anomalies
-                if a.level.upper() in ("EMERGENCY", "FATAL", "CRITICAL", "ERROR")
-            )
-            severe_pct = severe / len(entries)
-            if severe_pct >= 0.30:
+            ]
+            is_incident, inc_score, inc_reasons = _assess_incident(_assess_items, len(entries))
+            if is_incident:
                 incident_flag = " [bold red blink]⚠ INCIDENT[/bold red blink]"
 
         # --- category-wise breakdown ---
@@ -709,6 +814,11 @@ def analyze(
             f"[bold cyan][LogLens][/bold cyan] Anomalies detected: "
             f"[bold red]{n_anomalies:,}[/bold red] 🚨{incident_flag}"
         )
+        if incident_flag:
+            console.print(
+                f"[bold red][LogLens][/bold red] Incident score: "
+                f"[bold]{inc_score:.2f}[/bold] [dim]— {'; '.join(inc_reasons)}[/dim]"
+            )
 
         # print breakdown tree
         ordered_levels = [lvl for lvl in CATEGORY_ORDER if lvl in level_counts]
@@ -830,16 +940,9 @@ def analyze(
             )
 
         # --- machine-readable output + CI/CD gating ---
+        line_of = {id(e): i + 1 for i, e in enumerate(entries)}
         classic_items = [
-            {
-                "level": g.level,
-                "service": g.service,
-                "score": round(g.max_score, 4),
-                "count": g.count,
-                "message": g.sample,
-                "reasons": list(getattr(g, "reasons", []) or []),
-            }
-            for g in groups
+            _family_item(g, [filtered_anomalies[i] for i in g.indices], line_of) for g in groups
         ]
         if as_json:
             _emit_json(
@@ -883,14 +986,7 @@ def ask(
 
     async def _run():
         console.print(f"\n[bold cyan][LogLens][/bold cyan] Source: [yellow]{source}[/yellow]")
-        entries = []
-        fmt = None
-        async for line in stream_lines(source):
-            if fmt is None:
-                fmt = detect_format(line)
-            entry = parse_line(line, fmt)
-            if entry:
-                entries.append(entry)
+        entries, _line_count, _fmt, _fmt_conf, _layout = await _collect_entries(source)
         if not entries:
             console.print("[bold red]No valid log entries found.[/bold red]")
             raise typer.Exit(code=1)
