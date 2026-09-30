@@ -138,8 +138,8 @@ class Signals:
     level_total: int = 1
     file_total: int = 1
 
-    has_clusters: bool = False
-    cluster_label: int = 0
+    has_clusters: bool = False  # True when DBSCAN clustering was run (classic/deep)
+    cluster_label: int = 0  # -1 == unclustered noise point
     cluster_size: float = 0.0
     rare_min: int = 3
     rare_pct: float = 0.01
@@ -264,7 +264,7 @@ def score(sig: Signals) -> ScoreResult:
         and sig.outlier_z >= OUTLIER_Z_EXEMPT
         and sig.outlier_dist > OUTLIER_DIST_FLOOR
     )
-    if sev >= 5 and sig.cluster_label != -1 and not extreme_outlier:
+    if sev >= 5 and not extreme_outlier:
         rarity *= sig.safe_rarity_damp
     if sig.chronic:
         rarity *= CHRONIC_DAMP
