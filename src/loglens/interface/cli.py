@@ -3,6 +3,7 @@ import functools
 import json
 import os
 import sys
+import time
 from typing import TYPE_CHECKING, Any, cast
 
 import typer
@@ -130,6 +131,7 @@ _FAIL_ON_RANK = {
 }
 
 
+# Severities that, on their own, indicate a real incident.
 _INCIDENT_CRIT_LEVELS = {"EMERGENCY", "ALERT", "FATAL", "CRITICAL"}
 _INCIDENT_SEVERE_RATIO = 0.30  # fraction of parsed lines that are severe → burst
 _INCIDENT_BURST_FAMILIES = 5  # this many critical families → clear burst
@@ -138,13 +140,6 @@ _INCIDENT_BURST_FAMILIES = 5  # this many critical families → clear burst
 def _assess_incident(
     items: list[dict[str, Any]], lines_parsed: int
 ) -> tuple[bool, float, list[str]]:
-    """Decide whether the run is an incident, with a 0-1 score and reasons.
-
-    An incident fires when ANY of: at least one CRITICAL/FATAL family, a severe
-    burst (≥30% of parsed lines severe), or many critical families. This replaces
-    the old "≥30% of all lines" rule, which never fired on realistic logs where a
-    few catastrophic families sit among mostly-normal traffic.
-    """
     crit = [it for it in items if str(it.get("level", "")).upper() in _INCIDENT_CRIT_LEVELS]
     errs = [it for it in items if str(it.get("level", "")).upper() in ("ERROR",)]
     severe_lines = sum(int(it.get("count", 1) or 1) for it in (*crit, *errs))
@@ -180,6 +175,13 @@ def _template_id(template: str) -> str:
 
 
 def _seed_everything(seed: int) -> None:
+    """Seed every RNG so a run is reproducible (P1.5).
+
+    The detection pipeline is already deterministic given fixed seeds; this pins
+    the global Python/NumPy generators too, for any third-party library or future
+    stochastic detector that reads them, and exports PYTHONHASHSEED so forked
+    turbo workers inherit it.
+    """
     import os
     import random as _random
 
@@ -196,6 +198,13 @@ def _seed_everything(seed: int) -> None:
 async def _collect_entries(
     source: str, sniff_n: int = 500
 ) -> tuple[list[Any], int, str, float, dict[str, Any]]:
+    """Stream a source, pick its format from a sample, and parse every line.
+
+    Sniffing from a sample (rather than only line 1) is what lets the parser
+    recover ``service`` for generic ``<ts> LEVEL service message`` logs instead
+    of falling back to ``service=unknown``. Returns
+    ``(entries, line_count, fmt, confidence, layout)``.
+    """
     line_count = 0
     entries: list[Any] = []
     sample_buf: list[str] = []
@@ -238,6 +247,8 @@ def _family_item(
     tid = _template_id(getattr(g, "template", "") or g.sample)
     reasons = list(getattr(g, "reasons", []) or [])
 
+    # Lightweight impact + trace-kind from the family's sample + severity (the deep,
+    # trace-reconstructed version lives in `loglens explain`).
     from loglens.detection.diagnosis import diagnose as _diagnose
 
     _d = _diagnose(g.sample, [], level=g.level)
@@ -258,6 +269,10 @@ def _family_item(
             if r.note:
                 reasons = [*reasons, r.note]
 
+    # Per-detector sub-scores (D12): the max each detector contributed across this
+    # family's members. N novelty · B rate/burst · P parameter · C co-occurrence ·
+    # S sequence · R routineness (0..1, descriptive). Defaults to 0 on fast paths
+    # (e.g. turbo) that don't compute component scores.
     _agg = {"N": 0.0, "B": 0.0, "P": 0.0, "C": 0.0, "S": 0.0}
     for m in members:
         ms = (getattr(m, "metadata", None) or {}).get("scores")
@@ -267,6 +282,9 @@ def _family_item(
     scores_block: dict[str, float | None] = {k: round(v, 4) for k, v in _agg.items()}
     scores_block["R"] = r_value
 
+    # provisional: a low-confidence family the reader should treat as tentative.
+    # retracted: reserved for the streaming path (a family later superseded); always
+    # False in batch analysis today.
     provisional = bool(confidence and confidence.startswith("Low"))
 
     return {
@@ -302,6 +320,8 @@ def _family_item(
 
 
 def _build_incidents(source: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group families into incidents (D13), stamp each item's ``incident_id`` in place,
+    and return a serialisable incident summary list for the JSON payload."""
     from loglens.detection.incidents import Family, group_incidents
     from loglens.detection.timeutil import parse_ts
 
@@ -343,6 +363,25 @@ def _build_incidents(source: str, items: list[dict[str, Any]]) -> list[dict[str,
     ]
 
 
+def _alert_budget_payload(items: list[dict[str, Any]], budget_per_day: float) -> dict[str, Any]:
+    """Per-service alert budget (D14) over the observed window. Report-only."""
+    from loglens.detection.calibration import calibrate, to_payload
+    from loglens.detection.timeutil import parse_ts
+
+    dts = [
+        d
+        for it in items
+        for k in ("first_seen", "last_seen")
+        if (d := parse_ts(it.get(k) or "")) is not None
+    ]
+    window = (max(dts) - min(dts)).total_seconds() if len(dts) >= 2 else None
+    alerts = [(it.get("service", "unknown"), float(it.get("score", 0.0))) for it in items]
+    budgets = calibrate(alerts, budget_per_day=budget_per_day, window_seconds=window)
+    payload = to_payload(budgets, budget_per_day)
+    payload["window_seconds"] = int(window) if window else None
+    return payload
+
+
 def _emit_json(
     source: str,
     mode: str,
@@ -350,6 +389,7 @@ def _emit_json(
     lines_parsed: int,
     incident: bool,  # kept for signature stability; recomputed from items below
     items: list[dict[str, Any]],
+    alert_budget: float = 5.0,
 ) -> None:
     """Print a machine-readable analysis result to stdout (for CI/CD)."""
     is_incident, incident_score, incident_reasons = _assess_incident(items, lines_parsed)
@@ -370,6 +410,7 @@ def _emit_json(
         "incident_score": incident_score,
         "incident_reasons": incident_reasons,
         "incidents": incidents,
+        "alert_budget": _alert_budget_payload(items, alert_budget),
         "anomaly_count": len(items),
         "anomalies": items,
     }
@@ -515,6 +556,9 @@ def _write_html(html_out, source, total_lines, anomalies, rca_result=None, score
 
 
 def _build_info() -> dict[str, str]:
+    """Version + build provenance. Commit/date are baked at build time via a
+    generated ``loglens._build`` module, or the ``LOGLENS_COMMIT`` /
+    ``LOGLENS_BUILD_DATE`` env vars; otherwise ``unknown``."""
     import platform
 
     commit = build_date = ""
@@ -561,12 +605,154 @@ def help_command(ctx: typer.Context):
     console.print(root.get_help())
 
 
+def _is_local_file(source: str) -> bool:
+    """True for a readable local file path (not a URL / stdin / command stream),
+    so auto-scaling only engages where byte-range splitting is meaningful."""
+    if not source or source == "stdin":
+        return False
+    if source.startswith(("http://", "https://", "cmd:")):
+        return False
+    return os.path.isfile(source)
+
+
+def _run_parallel(
+    source: str,
+    *,
+    mode: str,
+    workers: int | None,
+    headroom: int | None,
+    limit: int,
+    as_json: bool,
+    started: float,
+) -> None:
+    import time as _time
+
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+
+    from loglens.application.autoscale import worker_budget
+    from loglens.application.parallel_scan import parallel_analyze_file
+
+    pw = workers if workers else worker_budget(headroom=headroom)
+
+    console.print(
+        f"\n[bold cyan][LogLens][/bold cyan] Source: [yellow]{source}[/yellow]", highlight=False
+    )
+    console.print(
+        f"[bold cyan][LogLens][/bold cyan] Mode: [bold magenta]⧉ Parallel "
+        f"({mode}, {pw} workers)[/bold magenta] [dim]— full detector per byte-range slice; "
+        f"results are per-slice approximate (like --turbo), not a whole-file run[/dim]"
+    )
+
+    if as_json:
+        result = parallel_analyze_file(
+            source, mode=mode, workers=pw, limit=limit, on_event=None, on_progress=None
+        )
+        result["elapsed_seconds"] = round(_time.perf_counter() - started, 3)
+        typer.echo(json.dumps(result, indent=2, sort_keys=True))
+        return
+
+    bar = Progress(
+        TextColumn("[bold cyan]  slices"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        TextColumn("eta"),
+        TimeRemainingColumn(),
+        console=console,
+    )
+    with bar:
+        task = bar.add_task("slices", total=pw)
+
+        def _progress(done: int, total: int) -> None:
+            bar.update(task, completed=done, total=total)
+
+        result = parallel_analyze_file(
+            source,
+            mode=mode,
+            workers=pw,
+            limit=limit,
+            on_progress=_progress,
+            on_event=lambda k, d: None,
+        )
+
+    console.print(
+        f"[bold cyan][LogLens][/bold cyan] Slices: [bold]{result['slices']}[/bold] "
+        f"· Lines: [bold]{result['lines_parsed']:,}[/bold] parsed"
+        + (
+            f" · [red]{result['faulted_slices']} slice fault(s)[/red]"
+            if result["faulted_slices"]
+            else ""
+        )
+    )
+    inc = " [bold red]⚠ INCIDENT[/bold red]" if result["incident"] else ""
+    console.print(
+        f"[bold cyan][LogLens][/bold cyan] "
+        f"[bold]{result['family_count']:,}[/bold] anomaly families "
+        f"· [bold]{result['anomaly_lines']:,}[/bold] flagged lines{inc}",
+        highlight=False,
+    )
+    fams = result["families"][: result.get("display_limit", limit)]
+    if fams:
+        table = Table(
+            title=f"TOP ANOMALY FAMILIES ({result['family_count']:,} total)",
+            title_style="bold",
+            header_style="bold cyan",
+        )
+        table.add_column("Level")
+        table.add_column("Count", justify="right")
+        table.add_column("Score", justify="right")
+        table.add_column("Service(s)")
+        table.add_column("Template")
+        for f in fams:
+            svc = ", ".join(f.get("services", [])) or "-"
+            table.add_row(
+                str(f.get("level", "")),
+                f"{f.get('count', 0):,}",
+                f"{float(f.get('score', 0.0)):.2f}",
+                svc[:24],
+                str(f.get("sample", ""))[:80],
+            )
+        console.print(table)
+    console.print(
+        "[dim](per-slice approximate — --no-auto-scale for the exact whole-file verdict)[/dim]"
+    )
+
+    try:
+        from loglens.application.results_store import save_results
+
+        out = source + ".loglens.json"
+        save_results(out, result)
+        console.print(
+            f"[bold cyan][LogLens][/bold cyan] results saved → explore them with "
+            f"[bold]loglens explore {out}[/bold]",
+            highlight=False,
+        )
+    except OSError as exc:
+        console.print(f"[dim][LogLens] could not save results: {exc}[/dim]")
+    console.print(
+        f"[bold cyan][LogLens][/bold cyan] ✓ completed in "
+        f"[bold]{_time.perf_counter() - started:.2f}s[/bold]",
+        highlight=False,
+    )
+
+
 @app.command()
 def analyze(
     source: str = typer.Option(..., help="Log source: file path, URL, or stdin"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Stop after ingestion, show stats only"),
     verbose: bool = typer.Option(False, "--verbose", help="Show sample parsed entry"),
-    workers: int = typer.Option(4, "--workers", help="Number of parallel workers"),
+    workers: int = typer.Option(
+        0,
+        "--workers",
+        help="Parallel workers for the scan (0 = auto: cgroup/affinity-aware, leaves CPU "
+        "headroom free). Explicit value overrides the auto budget.",
+    ),
     deep: bool = typer.Option(False, "--deep", help="Use neural embeddings (accurate, slower)"),
     limit: int = typer.Option(20, "--limit", help="Max anomaly families to display (default: 20)"),
     sort_by: str = typer.Option(
@@ -578,6 +764,31 @@ def analyze(
         False,
         "--turbo",
         help="Fast multiprocess scan for huge files (byte-range + template dedup, skips embeddings)",
+    ),
+    parallel: bool = typer.Option(
+        False,
+        "--parallel",
+        help="Run the FULL detector on byte-range slices across cores, then merge "
+        "(progress bar + ETA). Fast on huge files; results are per-slice approximate "
+        "(like --turbo), not identical to a whole-file run. Honours --workers / --headroom.",
+    ),
+    auto_scale: bool = typer.Option(
+        True,
+        "--auto-scale/--no-auto-scale",
+        help="Auto-distribute load: a very large file is switched to the fast parallel "
+        "scan by itself, leaving CPU headroom free. --no-auto-scale forces the exact pipeline.",
+    ),
+    headroom: int = typer.Option(
+        -1,
+        "--headroom",
+        help="CPU cores to leave free for your other work when auto-scaling "
+        "(default: ~25%% of cores, at least 1).",
+    ),
+    max_exact_lines: int = typer.Option(
+        0,
+        "--max-exact-lines",
+        help="Line estimate above which auto-scale switches a single file to the fast "
+        "parallel scan (0 = default 500k).",
     ),
     explain: int = typer.Option(
         0,
@@ -644,11 +855,19 @@ def analyze(
     state_dir: str = typer.Option(
         "", "--state-dir", help="Where baselines are stored (default: ~/.loglens/baselines)."
     ),
+    alert_budget: float = typer.Option(
+        5.0,
+        "--alert-budget",
+        help="Target alerts/day/service for the calibrated budget report (default 5). Report-only.",
+    ),
 ):
     """Analyze a log file for anomalies (fast / turbo / deep, with CI/CD gating)."""
+    _run_start = time.perf_counter()
     _load()
     _seed_everything(seed)
     as_json = output_format.strip().lower() == "json"
+    # Set unconditionally: `console` is a module singleton, so a prior JSON run
+    # would otherwise leave it quiet and silence this terminal run.
     console.quiet = as_json
     if as_json:
         pass  # stdout stays clean for the JSON payload
@@ -661,9 +880,58 @@ def analyze(
         console.print(f"[bold red][LogLens][/bold red] {_e}")
         raise typer.Exit(code=1) from None
 
+    # --- self-tuning load distribution -----------------------------------
+    # For a plain `analyze <file>`, decide by ourselves whether the file is big
+    # enough to warrant the fast parallel scan, and how many workers to use while
+    # leaving CPU headroom for the user's other work. Explicit --turbo or
+    # --no-auto-scale skip the heuristic; non-file sources (URL/stdin/cmd) too.
+    use_turbo = turbo
+    use_parallel = parallel
+    eff_workers = workers
+    if auto_scale and not turbo and not parallel and _is_local_file(source):
+        from loglens.application.autoscale import plan_for_file
+
+        plan = plan_for_file(
+            source,
+            headroom=(None if headroom < 0 else headroom),
+            max_exact_lines=(max_exact_lines or None),
+        )
+        if plan.strategy == "scan":
+            use_parallel = True
+            mb = plan.size_bytes / 1e6
+            note = ""
+            if deep or (model and model.strip()):
+                note = (
+                    " [dim](distributed path is unsupervised per slice; "
+                    "--no-auto-scale for the exact model run)[/dim]"
+                )
+            console.print(
+                f"[bold cyan][LogLens][/bold cyan] large input (~{plan.est_lines:,} lines, "
+                f"{mb:,.0f} MB): auto-distributing across cores (anomaly families)." + note,
+                highlight=False,
+            )
+
+    # Explicit --turbo with no --workers given → use the headroom-aware budget.
+    if use_turbo and workers <= 0:
+        from loglens.application.autoscale import worker_budget
+
+        eff_workers = worker_budget(headroom=(None if headroom < 0 else headroom))
+
+    if use_parallel and _is_local_file(source):
+        _run_parallel(
+            source,
+            mode=("deep" if deep else "fast"),
+            workers=(workers if workers > 0 else None),
+            headroom=(None if headroom < 0 else headroom),
+            limit=limit,
+            as_json=as_json,
+            started=_run_start,
+        )
+        return
+
     async def _run():
 
-        if turbo:
+        if use_turbo:
             console.print(f"\n[bold cyan][LogLens][/bold cyan] Source: [yellow]{source}[/yellow]")
             console.print(
                 "[bold cyan][LogLens][/bold cyan] Mode: [bold magenta]⚡ Turbo (parallel scan)[/bold magenta] "
@@ -674,7 +942,9 @@ def analyze(
             with console.status("[bold magenta]⚡ Turbo scanning…[/bold magenta]", spinner="dots"):
                 res = await loop.run_in_executor(
                     None,
-                    functools.partial(turbo_scan, source, workers=(workers if workers else None)),
+                    functools.partial(
+                        turbo_scan, source, workers=(eff_workers if eff_workers else None)
+                    ),
                 )
             console.print(f"[bold cyan][LogLens][/bold cyan] Workers: [bold]{res.workers}[/bold]")
             console.print(
@@ -758,6 +1028,9 @@ def analyze(
                     html_out, source, res.parsed_lines, rca_entries, rca_result, scores=turbo_scores
                 )
 
+            # --- machine-readable output + CI/CD gating ---
+            # Turbo is a byte-range/template scan, so it has no per-line numbers;
+            # line_numbers[] is intentionally empty here (use fast mode for those).
             from loglens.detection.diagnosis import diagnose as _diagnose_turbo
 
             def _turbo_item(a):
@@ -776,6 +1049,8 @@ def analyze(
                     "sample_lines": [a.sample],
                     "message": a.sample,
                     "calibrated_p": None,
+                    # turbo skips embeddings + component detectors, so sub-scores aren't
+                    # computed here; keys stay present (zeros / null) for schema parity.
                     "scores": {"N": 0.0, "B": 0.0, "P": 0.0, "C": 0.0, "S": 0.0, "R": None},
                     "impact": _d.impact,
                     "trace_kind": _d.trace_kind,
@@ -796,7 +1071,9 @@ def analyze(
             turbo_items = [_turbo_item(a) for a in anomalies]
             if as_json:
                 # incident/score/reasons are recomputed from items inside _emit_json.
-                _emit_json(source, "turbo", None, res.parsed_lines, False, turbo_items)
+                _emit_json(
+                    source, "turbo", None, res.parsed_lines, False, turbo_items, alert_budget
+                )
             _apply_fail_on(fail_on, turbo_items)
             return  # turbo done — skip the classic pipeline
 
@@ -868,6 +1145,10 @@ def analyze(
             f"[bold green]shape={vectors.shape}[/bold green]"
         )
 
+        # --- self-learning baseline (zero-touch memory) ---
+        # Load what we've learned as "normal" for this source so genuinely new
+        # templates score as novel; after detection we fold this run's normal lines
+        # back in, so the next run is smarter. No training step, no user action.
         from loglens.application import baseline_store as _bstore
 
         _bkey = _bstore.baseline_key(source, profile)
@@ -899,6 +1180,10 @@ def analyze(
             except OSError as _exc:
                 console.print(f"[dim][LogLens] baseline not saved: {_exc}[/dim]")
 
+            # Auto-prepare the supervised head from usage: bank this run's features +
+            # the detector's own verdicts (pseudo-labels), fit when enough of both
+            # classes accumulate. Lets the user switch to --model auto with no train
+            # step. (It imitates the unsupervised detector; real gains need labels.)
             try:
                 import numpy as _np
 
@@ -1066,7 +1351,7 @@ def analyze(
         stats = await run_worker_pool(
             entry_stream(),
             process_fn,
-            num_workers=workers,
+            num_workers=(workers or 4),  # 0 = auto → the classic default
         )
 
         if not as_json:
@@ -1086,19 +1371,24 @@ def analyze(
             if a.level.upper() != "INFO" or any(kw in a.message.lower() for kw in INFO_KEYWORDS)
         ]
 
+        # Sort the *members* (affects which sample/reasons a family shows first).
         if sort_by == "severity":
             filtered_anomalies.sort(key=_severity)
         elif sort_by == "service":
             filtered_anomalies.sort(key=lambda a: a.service)
+        # "time" / "recent" = keep original (chronological) member order
 
         # --- Phase 1: template grouping (families, ×N) ---
         groups = group_anomalies(filtered_anomalies)
 
+        # Routineness (D11) — descriptive badge only, never changes a score.
         from loglens.detection.routineness import compute_routineness, confidence_label
         from loglens.detection.timeutil import humanize_delta, humanize_span, parse_ts
 
         _rmap = compute_routineness(entries, baseline=_baseline)
 
+        # Per-family time span (from member timestamps) + a global "now" anchor so
+        # the display can order by recency and show when each family last fired.
         _gtimes: dict[int, tuple] = {}
         _anchor = None
         for g in groups:
@@ -1109,6 +1399,7 @@ def analyze(
             if last_dt and (_anchor is None or last_dt > _anchor):
                 _anchor = last_dt
 
+        # --- Family display order (newest-first by default) ---
         _MIN_DT = __import__("datetime").datetime.min
         if sort_by == "recent":
             groups.sort(key=lambda g: _gtimes[id(g)][1] or _MIN_DT, reverse=True)
@@ -1116,6 +1407,7 @@ def analyze(
             groups.sort(key=lambda g: _gtimes[id(g)][0] or _MIN_DT)
         elif sort_by == "service":
             groups.sort(key=lambda g: (g.service, -g.max_score))
+        # "severity" keeps group_anomalies' score-desc order
 
         def _conf_color(label: str) -> str:
             head = label.split()[0]
@@ -1178,9 +1470,44 @@ def analyze(
             suppressed = len(anomalies) - len(filtered_anomalies)
             if suppressed:
                 console.print(f"[dim]{suppressed} INFO-level false positives suppressed[/dim]")
+
+            # --- calibrated alert budget (D14): measured alerts/day vs budget --------
+            from loglens.detection.calibration import calibrate
+
+            _bud_dts = [d for gid in _gtimes for d in _gtimes[gid] if d is not None]
+            _window = (
+                (max(_bud_dts) - min(_bud_dts)).total_seconds() if len(_bud_dts) >= 2 else None
+            )
+            _budgets = calibrate(
+                [(g.service, g.max_score) for g in groups],
+                budget_per_day=alert_budget,
+                window_seconds=_window,
+            )
+            _over = [b for b in _budgets if not b.within_budget]
+            if _over:
+                parts = [
+                    f"[yellow]{b.service}[/yellow] ~{b.measured_per_day:g}/day" for b in _over[:4]
+                ]
+                basis = _over[0].basis
+                console.print(
+                    f"[dim][LogLens] Alert budget (~{alert_budget:g}/day/service): "
+                    f"⚠ over for {', '.join(parts)}"
+                    + (f" [dim](rate {basis})[/dim]" if basis != "measured" else "")
+                    + "[/dim]"
+                )
+            elif _budgets:
+                console.print(
+                    f"[dim][LogLens] Alert budget (~{alert_budget:g}/day/service): "
+                    "✓ within budget[/dim]"
+                )
         else:
             console.print("\n[bold green] No anomalies detected![/bold green]")
 
+        # --- recommend the supervised head (second opinion) when we ran unsupervised ---
+        # Fire on the zero-config path (no explicit model requested). Gate on the
+        # user's own `--model` choice, NOT on `model_path`: `model_path` also picks
+        # up the *bundled* default head, which would wrongly suppress the hint. If
+        # the user already asked for a specific model (incl. `--model auto`), stay quiet.
         if not as_json and not model.strip():
             from loglens.application import autotrain as _at2
 
@@ -1220,6 +1547,9 @@ def analyze(
                 html_out, source, len(entries), filtered_anomalies, rca_result, scores=entry_scores
             )
 
+        # --- machine-readable output + CI/CD gating ---
+        # Map each entry's identity to its 1-based line number so families can
+        # carry real line_numbers[] (unblocks benchmarking against labels.json).
         line_of = {id(e): i + 1 for i, e in enumerate(entries)}
         classic_items = [
             _family_item(g, [filtered_anomalies[i] for i in g.indices], line_of, _rmap)
@@ -1233,6 +1563,7 @@ def analyze(
                 len(entries),
                 bool(incident_flag),
                 classic_items,
+                alert_budget,
             )
         _apply_fail_on(fail_on, classic_items)
 
@@ -1247,6 +1578,11 @@ def analyze(
             console.print(table)
 
     asyncio.run(_run())
+    _elapsed = time.perf_counter() - _run_start
+    console.print(
+        f"[bold cyan][LogLens][/bold cyan] ✓ completed in [bold]{_elapsed:.2f}s[/bold]",
+        highlight=False,
+    )
 
 
 _IMPACT_STYLE = {
@@ -1334,6 +1670,7 @@ def explain(
     _load()
     _seed_everything(seed)
     as_json = output_format.strip().lower() == "json"
+    # Unconditional: reset the shared console so a prior JSON run can't silence this one.
     console.quiet = as_json
 
     from loglens.detection.filetype import InvalidSourceError, check_source
@@ -1344,6 +1681,7 @@ def explain(
         console.print(f"[bold red][LogLens][/bold red] {_e}")
         raise typer.Exit(code=1) from None
 
+    # Read (never write) the learned baseline so novelty + routineness `age` are informed.
     from loglens.application import baseline_store as _bstore
 
     _sdir = state_dir or None
@@ -1351,12 +1689,15 @@ def explain(
     if not no_learn:
         _baseline = _bstore.load_baseline(_bstore.baseline_key(source, profile), _sdir)
 
+    # Use the same ingestion as `analyze` (sniffs format + recovers the service
+    # column) so cards show real services, then score via the shared engine.
     entries, _line_count, _fmt, _fmt_conf, _layout = asyncio.run(_collect_entries(source))
     res = _analyze_entries(entries, RunConfig(mode="fast"), baseline=_baseline, fmt=_fmt)
     entries = res.entries
     anoms = list(res.anomalies)
     rmap = compute_routineness(entries, baseline=_baseline)
 
+    # --- resolve the time window ------------------------------------------- #
     dated = [(a, parse_ts(getattr(a, "timestamp", ""))) for a in anoms]
     parsed = [(a, d) for a, d in dated if d is not None]
     undated = [a for a, d in dated if d is None]
@@ -1374,6 +1715,7 @@ def explain(
         in_window = parsed
         windowed = False
 
+    # --- group the in-window anomalies ------------------------------------- #
     win_anoms = [a for a, _ in in_window]
     win_dts = {id(a): d for a, d in in_window}
     groups = _group(
@@ -1396,6 +1738,7 @@ def explain(
     from loglens.detection.diagnosis import diagnose
 
     def _recovery_after(idx: int | None, service: str) -> bool:
+        """Does a later line from the same service signal recovery? (→ non-blocking)"""
         from loglens.detection.diagnosis import _RECOVERY
 
         if idx is None:
@@ -2037,18 +2380,64 @@ def bench_suite(
         raise typer.Exit(code=1)
 
 
+def _fetch_with_progress(
+    sysname: str, out: str, max_lines: int | None, *, quiet: bool = False
+) -> tuple[str, int, int, float]:
+    """Fetch a dataset with a live single-line progress read-out (download MB, then
+    parse line count) and return ``(name, total, anom, seconds)``. Progress is
+    suppressed when ``quiet`` (e.g. JSON output)."""
+    import time
+
+    from loglens.application import loghub
+
+    t0 = time.perf_counter()
+    if quiet:
+        name, total, anom = loghub.fetch_dataset(sysname, out, max_lines=max_lines)
+        return name, total, anom, time.perf_counter() - t0
+
+    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as prog:
+        task = prog.add_task("starting…", total=None)
+
+        def on_dl(done: int, total_bytes: int | None) -> None:
+            pct = f" ({done / total_bytes:.0%})" if total_bytes else ""
+            prog.update(task, description=f"↓ downloading {done / 1e6:,.0f} MB{pct}")
+
+        def on_ln(count: int) -> None:
+            prog.update(task, description=f"⚙ parsing {count:,} lines")
+
+        name, total, anom = loghub.fetch_dataset(
+            sysname, out, max_lines=max_lines, on_download=on_dl, on_line=on_ln
+        )
+    return name, total, anom, time.perf_counter() - t0
+
+
 @app.command("bench-fetch")
 def bench_fetch(
-    system: str = typer.Option(..., "--system", help="Dataset: bgl | hdfs"),
+    system: str = typer.Option(..., "--system", help="Dataset: bgl | hdfs | thunderbird"),
     out: str = typer.Option("benchdata", "--out", help="Output directory (log + labels.json)"),
     sample: bool = typer.Option(
         False, "--sample", help="BGL only: download the 2k labeled sample from GitHub"
     ),
     src: str = typer.Option(
-        "", "--from", help="Path to a full local dataset log (BGL.log or HDFS.log from Zenodo)"
+        "",
+        "--from",
+        help="Path to a full local dataset log (BGL.log / HDFS.log / Thunderbird.log from Zenodo)",
     ),
     labels: str = typer.Option(
         "", "--labels", help="HDFS only: path to anomaly_label.csv (block → Normal/Anomaly)"
+    ),
+    download: bool = typer.Option(
+        False,
+        "--download",
+        help="Download the full dataset from LogHub/Zenodo (bgl | thunderbird), then convert.",
     ),
     max_lines: int = typer.Option(0, "--max-lines", help="Cap lines converted (0 = all)"),
 ):
@@ -2060,7 +2449,15 @@ def bench_fetch(
     from loglens.application import loghub
 
     try:
-        if sysname == "bgl":
+        if download and sysname in ("bgl", "thunderbird"):
+            archive = loghub.DATASET_ARCHIVES[sysname][0]
+            console.print(
+                f"[bold cyan][LogLens][/bold cyan] Downloading {archive} from LogHub/Zenodo"
+                + (f" (first {cap:,} lines)…" if cap else " (full)…")
+            )
+            name, total, anom, secs = _fetch_with_progress(sysname, out, cap)
+            console.print(f"[dim]  fetched in {secs:.1f}s[/dim]")
+        elif sysname == "bgl":
             if sample:
                 console.print("[bold cyan][LogLens][/bold cyan] Downloading BGL 2k sample…")
                 name, total, anom = loghub.fetch_bgl_sample(out)
@@ -2068,7 +2465,7 @@ def bench_fetch(
                 name, total, anom = loghub.convert_bgl(src, out, max_lines=cap)
             else:
                 console.print(
-                    "[bold red][LogLens][/bold red] BGL needs --sample or --from <BGL.log>"
+                    "[bold red][LogLens][/bold red] BGL needs --download, --sample or --from <BGL.log>"
                 )
                 raise typer.Exit(code=1)
         elif sysname == "hdfs":
@@ -2079,8 +2476,18 @@ def bench_fetch(
                 )
                 raise typer.Exit(code=1)
             name, total, anom = loghub.convert_hdfs(src, labels, out, max_lines=cap)
+        elif sysname == "thunderbird":
+            if not src:
+                console.print(
+                    "[bold red][LogLens][/bold red] Thunderbird needs --download or "
+                    "--from <Thunderbird.log>"
+                )
+                raise typer.Exit(code=1)
+            name, total, anom = loghub.convert_thunderbird(src, out, max_lines=cap)
         else:
-            console.print(f"[bold red][LogLens][/bold red] Unknown system {system!r} (bgl | hdfs)")
+            console.print(
+                f"[bold red][LogLens][/bold red] Unknown system {system!r} (bgl | hdfs | thunderbird)"
+            )
             raise typer.Exit(code=1)
     except FileNotFoundError as exc:
         console.print(f"[bold red][LogLens][/bold red] {exc}")
@@ -2094,6 +2501,200 @@ def bench_fetch(
         f"[bold]{total:,}[/bold] lines, [bold red]{anom:,}[/bold red] labeled anomalies"
     )
     console.print(f"[dim]  Now run: loglens bench-suite --dir {out}[/dim]")
+
+
+@app.command("bench-routineness")
+def bench_routineness(
+    directory: str = typer.Option(
+        "", "--dir", help="Labeled suite dir with labels.json (from bench-fetch)."
+    ),
+    download: str = typer.Option(
+        "",
+        "--download",
+        help="Fetch a dataset (bgl | thunderbird), evaluate, then DELETE it — leaves "
+        "nothing on disk. Use instead of --dir.",
+    ),
+    max_lines: int = typer.Option(
+        0, "--max-lines", help="With --download: cap lines fetched (0 = all)."
+    ),
+    keep: bool = typer.Option(
+        False, "--keep", help="With --download: keep the fetched suite instead of deleting it."
+    ),
+    min_count: int = typer.Option(5, "--min-count", help="Min occurrences before R is measured."),
+    n_boot: int = typer.Option(1000, "--boot", help="Bootstrap resamples for the CI."),
+    seed: int = typer.Option(0, "--seed", help="Reproducible bootstrap."),
+    output_format: str = typer.Option("terminal", "--format", help="terminal | json"),
+):
+    """Re-test routineness R on labeled data (B3): template-AUC per host-spread variant
+    (normal / drop / invert), with a bootstrap CI and a promote-or-keep-badge verdict.
+    Promote R to a scored signal only if AUC ≥ 0.65 and the 95% CI excludes 0.5.
+
+    With ``--download bgl|thunderbird`` it fetches the dataset, evaluates, and removes
+    everything afterwards (nothing persists on disk) unless ``--keep`` is given."""
+    _load()
+    import shutil
+    import tempfile
+
+    from loglens.application import loghub
+
+    as_json = output_format.strip().lower() == "json"
+    console.quiet = as_json
+
+    # --download: fetch into a temp dir we delete at the end (no permanent footprint).
+    _tmp_dir: str | None = None
+    if download:
+        sysname = download.strip().lower()
+        if sysname not in loghub.DATASET_ARCHIVES:
+            console.print(
+                f"[bold red][LogLens][/bold red] --download takes bgl | thunderbird (got {download!r})"
+            )
+            raise typer.Exit(code=1)
+        _tmp_dir = tempfile.mkdtemp(prefix="loglens_bench_")
+        directory = _tmp_dir
+        try:
+            console.print(
+                f"[bold cyan][LogLens][/bold cyan] Fetching {sysname} from LogHub/Zenodo "
+                f"(ephemeral{', first ' + format(max_lines, ',') + ' lines' if max_lines else ''})…"
+            )
+            _name, _total, _anom, _secs = _fetch_with_progress(
+                sysname, directory, max_lines or None, quiet=as_json
+            )
+            if not as_json:
+                console.print(
+                    f"[bold green]✓[/bold green] fetched [bold]{_total:,}[/bold] lines "
+                    f"([bold red]{_anom:,}[/bold red] anomalies) in [bold]{_secs:.1f}s[/bold]"
+                )
+        except Exception as exc:
+            shutil.rmtree(_tmp_dir, ignore_errors=True)
+            console.print(f"[bold red][LogLens][/bold red] fetch failed: {exc}")
+            raise typer.Exit(code=1) from None
+    elif not directory:
+        console.print(
+            "[bold red][LogLens][/bold red] give --dir <suite> or --download bgl|thunderbird."
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        _bench_routineness_eval(
+            directory, min_count=min_count, n_boot=n_boot, seed=seed, as_json=as_json
+        )
+    finally:
+        if _tmp_dir and not keep:
+            shutil.rmtree(_tmp_dir, ignore_errors=True)
+            if not as_json:
+                console.print("[dim][LogLens] fetched data deleted (nothing kept on disk).[/dim]")
+        elif _tmp_dir and keep:
+            console.print(f"[dim][LogLens] fetched suite kept at {_tmp_dir}[/dim]")
+
+
+def _bench_routineness_eval(
+    directory: str, *, min_count: int, n_boot: int, seed: int, as_json: bool
+) -> None:
+    """Score one suite dir (shared by --dir and --download paths)."""
+    import json
+    import os
+    import time
+
+    from loglens.application.routineness_bench import best_variant, evaluate
+    from loglens.detection.parser import parse_line, sniff_format
+
+    labels_path = os.path.join(directory, "labels.json")
+    if not os.path.isfile(labels_path):
+        console.print(
+            f"[bold red][LogLens][/bold red] no labels.json in {directory!r} "
+            "— build one with `loglens bench-fetch`."
+        )
+        raise typer.Exit(code=1)
+    with open(labels_path, encoding="utf-8") as fh:
+        labels = json.load(fh)
+
+    report: dict[str, Any] = {"dir": directory, "files": {}}
+    for name in sorted(labels):
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            raw = fh.readlines()
+        # time the engine parse (P1.6: documented parse+template lines/sec)
+        _t_parse = time.perf_counter()
+        fmt, _conf, layout = sniff_format(raw)
+        entries = [e for line in raw if (e := parse_line(line, fmt, layout)) is not None]
+        parse_secs = time.perf_counter() - _t_parse
+        lps = (len(entries) / parse_secs) if parse_secs > 0 else None
+        if not as_json and len(entries) >= 50_000:
+            console.print(
+                f"[dim][LogLens] {name}: parsed {len(entries):,} lines in "
+                f"{parse_secs:.1f}s ({lps:,.0f} lines/s)[/dim]"
+            )
+        anom = set(labels[name].get("anomaly_lines", []))
+        _t_eval = time.perf_counter()
+        res = evaluate(entries, anom, min_count=min_count, n_boot=n_boot, seed=seed)
+        eval_secs = time.perf_counter() - _t_eval
+        best = best_variant(res)
+        report["files"][name] = {
+            "best_mode": best.mode,
+            "best_auc": best.auc,
+            "promotable": best.promotable,
+            "parse_seconds": round(parse_secs, 3),
+            "parse_lines_per_sec": round(lps) if lps else None,
+            "eval_seconds": round(eval_secs, 3),
+            "variants": {
+                m: {
+                    "auc": v.auc,
+                    "ci_low": v.ci_low,
+                    "ci_high": v.ci_high,
+                    "n_benign": v.n_benign,
+                    "n_anomalous": v.n_anomalous,
+                }
+                for m, v in res.items()
+            },
+        }
+
+    if as_json:
+        print(json.dumps(report, indent=2))
+        return
+
+    if not report["files"]:
+        console.print("[yellow][LogLens][/yellow] No labeled files found to score.")
+        return
+
+    table = Table(title="Routineness R re-test (template-AUC)", title_style="bold cyan")
+    table.add_column("File")
+    table.add_column("Variant")
+    table.add_column("AUC", justify="right")
+    table.add_column("95% CI", justify="center")
+    table.add_column("benign/anom", justify="right")
+    table.add_column("verdict")
+    for name, fr in report["files"].items():
+        for i, (m, v) in enumerate(fr["variants"].items()):
+            auc = f"{v['auc']:.3f}" if v["auc"] is not None else "—"
+            ci = f"[{v['ci_low']:.2f},{v['ci_high']:.2f}]" if v["ci_low"] is not None else "—"
+            promotable = (
+                v["auc"] is not None
+                and v["ci_low"] is not None
+                and v["auc"] >= 0.65
+                and v["ci_low"] > 0.5
+            )
+            verdict = "[green]promote[/green]" if promotable else "[dim]keep badge[/dim]"
+            table.add_row(
+                name if i == 0 else "",
+                m,
+                auc,
+                ci,
+                f"{v['n_benign']}/{v['n_anomalous']}",
+                verdict,
+            )
+    console.print(table)
+    any_promote = any(fr["promotable"] for fr in report["files"].values())
+    if any_promote:
+        console.print(
+            "\n[bold green]→ R clears the bar on at least one file[/bold green] "
+            "[dim](AUC ≥ 0.65, CI excludes 0.5) — consider flipping r_applied=true for that class.[/dim]"
+        )
+    else:
+        console.print(
+            "\n[dim]→ R stays badge-only (no variant clears AUC ≥ 0.65 with CI excluding 0.5).[/dim]"
+        )
 
 
 @app.command()
@@ -2208,6 +2809,289 @@ def watch(
         console.print(
             f"[bold cyan][LogLens][/bold cyan] HTML report saved to [bold]{html_report}[/bold]"
         )
+
+
+@app.command("analyze-multi")
+def analyze_multi(
+    source: list[str] = typer.Option(
+        ...,
+        "--source",
+        help="A log source (repeatable). Forms: PATH, ID=PATH, ID=cmd:CMD, ID=https://URL. "
+        "Each source gets its own pipeline; a noisy source can't distort another's baseline.",
+    ),
+    mode: str = typer.Option("fast", "--mode", help="Detection mode: fast | deep"),
+    sensitivity: str = typer.Option("normal", "--sensitivity", help="low | normal | high"),
+    workers: int = typer.Option(
+        0,
+        "--workers",
+        help="Worker processes (0 = auto: cgroup/affinity-aware, one core reserved for the "
+        "coordinator). Sources are analysed in parallel across workers.",
+    ),
+    overflow: str = typer.Option(
+        "block",
+        "--overflow",
+        help="Backpressure policy for live sources: block (lossless, default) | drop-oldest | "
+        "drop-newest | sample. ERROR and above are never dropped; every shed line is counted.",
+    ),
+    max_memory: int = typer.Option(
+        0,
+        "--max-memory",
+        help="Soft per-source queue bound in MB (0 = default). Drives backpressure/shedding.",
+    ),
+    gap: float = typer.Option(
+        30.0,
+        "--gap",
+        help="Seconds within which anomalies from different sources are correlated into one "
+        "cross-source incident.",
+    ),
+    output_format: str = typer.Option(
+        "terminal", "--format", help="Output format: terminal (default) | json."
+    ),
+) -> None:
+    """Analyse several log sources at once, each on its own pipeline, across cores.
+
+    Per-source results are byte-identical to analysing each source alone — the
+    parallelism and load handling never touch detection accuracy. Cross-source
+    incidents are correlated on a shared UTC timeline after detection.
+    """
+    from loglens.application.multisource import analyze_sources
+    from loglens.application.pipeline import OverflowPolicy
+    from loglens.application.sources import parse_sources
+
+    as_json = output_format.lower() == "json"
+    console.quiet = as_json
+
+    # Validate the overflow policy early (even though live streaming shedding is
+    # engaged by the pipeline, not the whole-file path) so a typo fails loudly.
+    try:
+        OverflowPolicy(overflow.lower())
+    except ValueError:
+        valid = ", ".join(p.value for p in OverflowPolicy)
+        raise typer.BadParameter(f"--overflow must be one of: {valid}") from None
+    _ = max_memory  # reserved for the streaming pipeline; accepted now for stability
+
+    try:
+        specs = parse_sources(list(source))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+    events: list[tuple[str, str]] = []
+    console.print(
+        f"[bold cyan][LogLens][/bold cyan] analysing {len(specs)} source(s)…", highlight=False
+    )
+    result = analyze_sources(
+        specs,
+        mode=mode,
+        sensitivity=sensitivity,
+        workers=(workers or None),
+        gap_seconds=gap,
+        on_event=lambda k, d: events.append((k, d)),
+    )
+
+    if as_json:
+        payload = result.to_dict()
+        payload["overflow_policy"] = overflow.lower()
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    table = Table(title="LogLens Multi-Source", title_style="bold cyan")
+    table.add_column("Source")
+    table.add_column("Worker", justify="right")
+    table.add_column("Format")
+    table.add_column("Lines", justify="right")
+    table.add_column("Anomalies", justify="right")
+    table.add_column("Lines/s", justify="right")
+    table.add_column("Status")
+    for st in result.stats.to_dict()["by_source"]:
+        row = next((s for s in result.per_source if s["id"] == st["source"]), {})
+        status = (
+            "[red]FAULT[/red]"
+            if not st["ok"]
+            else ("[yellow]degraded[/yellow]" if st["mode"] != "full" else "[green]ok[/green]")
+        )
+        table.add_row(
+            st["source"],
+            str(st["worker"]) if st["worker"] is not None else "-",
+            str(row.get("format") or "-"),
+            f"{st['lines_parsed']:,}",
+            f"{len(row.get('anomalies', [])):,}",
+            f"{st['lines_per_sec']:,.0f}",
+            status,
+        )
+    console.print(table)
+
+    console.print(
+        f"[bold cyan][LogLens][/bold cyan] {result.workers} worker(s) · "
+        f"{result.total_lines:,} lines · {result.total_anomalies:,} anomalies · "
+        f"{len(result.cross_incidents)} cross-source incident(s)",
+        highlight=False,
+    )
+    for ci in result.cross_incidents:
+        d = ci.to_dict()
+        console.print(
+            f"  [bold]cross-incident[/bold] [{d['worst_level']}] "
+            f"{', '.join(d['sources'])} · {d['anomaly_count']} anomalies "
+            f"over {d['duration_seconds']}s",
+            highlight=False,
+        )
+    if result.stats.total_dropped:
+        console.print(
+            f"[yellow][LogLens][/yellow] shed {result.stats.total_dropped:,} line(s) under "
+            f"backpressure (policy: {overflow.lower()}; ERROR+ never dropped)."
+        )
+    for kind, detail in events:
+        console.print(f"[dim][LogLens] {kind}: {detail}[/dim]")
+
+
+def _fmt_count(n: int) -> str:
+    return f"{n:,}"
+
+
+def _explorer_header(result: dict) -> "Panel":
+    from rich.panel import Panel
+
+    span = result.get("time_span") or {}
+    first, last = span.get("first_ts") or "?", span.get("last_ts") or "?"
+    days = ""
+    fe, le = span.get("first_epoch"), span.get("last_epoch")
+    if fe and le and le > fe:
+        days = f"  ·  span {(le - fe) / 86400:.1f} days"
+    inc = "  ·  [bold red]⚠ INCIDENT[/bold red]" if result.get("incident") else ""
+    body = (
+        f"[bold]{result.get('source', '?')}[/bold]\n"
+        f"Lines [bold]{_fmt_count(result.get('lines_parsed', 0))}[/bold]  ·  "
+        f"Families [bold]{_fmt_count(result.get('family_count', 0))}[/bold]  ·  "
+        f"Flagged [bold]{_fmt_count(result.get('anomaly_lines', 0))}[/bold]{inc}\n"
+        f"[dim]{first}  →  {last}{days}[/dim]"
+    )
+    return Panel(body, title="LogLens Explorer", title_align="left", border_style="cyan")
+
+
+def _render_severity(result: dict, window_seconds: int, window_label: str) -> None:
+    from loglens.application.results_store import SEVERITY_MENU, severity_count
+
+    table = Table(
+        title=f"Severity counts — {window_label}",
+        title_style="bold",
+        header_style="bold cyan",
+    )
+    table.add_column("Severity")
+    table.add_column("Count", justify="right")
+    for bucket, label in SEVERITY_MENU:
+        n = severity_count(result, bucket, window_seconds)
+        style = {"CRITICAL": "bold red", "ERROR": "red", "WARN": "yellow"}.get(bucket, "")
+        table.add_row(f"[{style}]{label}[/{style}]" if style else label, _fmt_count(n))
+    console.print(table)
+
+
+def _render_families(result: dict, families: list, title: str) -> None:
+    if not families:
+        console.print("[dim]  no matching families[/dim]")
+        return
+    table = Table(title=title, title_style="bold", header_style="bold cyan")
+    table.add_column("Level")
+    table.add_column("Count", justify="right")
+    table.add_column("Score", justify="right")
+    table.add_column("First seen")
+    table.add_column("Template")
+    for f in families:
+        style = {"CRITICAL": "bold red", "ERROR": "red", "WARN": "yellow"}.get(f.get("level"), "")
+        lvl = f"[{style}]{f.get('level', '')}[/{style}]" if style else f.get("level", "")
+        table.add_row(
+            lvl,
+            _fmt_count(int(f.get("count", 0))),
+            f"{float(f.get('score', 0.0)):.2f}",
+            str(f.get("first_ts", ""))[:23],
+            str(f.get("sample", ""))[:70],
+        )
+    console.print(table)
+
+
+@app.command()
+def explore(
+    results: str = typer.Argument(..., help="A results file saved by `analyze` (.loglens.json)."),
+) -> None:
+    """Interactively explore a saved analysis — severity counts over time, browse
+    and search anomaly families. Reads saved results only; never re-runs detection."""
+    from rich.panel import Panel  # noqa: F401  (used by header)
+
+    from loglens.application.results_store import (
+        SEVERITY_MENU,
+        TIME_WINDOWS,
+        families_in_window,
+        load_results,
+    )
+
+    try:
+        result = load_results(results)
+    except (OSError, ValueError) as exc:
+        console.print(f"[bold red][LogLens][/bold red] cannot read results: {exc}")
+        raise typer.Exit(code=1) from None
+
+    def _menu() -> str:
+        console.print()
+        console.print(_explorer_header(result))
+        console.print(
+            "\n  [bold]1[/bold] Severity counts in a time window"
+            "\n  [bold]2[/bold] Browse anomaly families"
+            "\n  [bold]3[/bold] Search families"
+            "\n  [bold]4[/bold] Top anomaly lines"
+            "\n  [bold]0[/bold] Quit\n"
+        )
+        return console.input("[bold cyan]loglens›[/bold cyan] ").strip()
+
+    def _pick(prompt: str, options: list, fmt) -> int | None:
+        for i, opt in enumerate(options, 1):
+            console.print(f"  [bold]{i}[/bold]) {fmt(opt)}")
+        raw = console.input(f"[bold cyan]{prompt}›[/bold cyan] ").strip()
+        if not raw.isdigit():
+            return None
+        idx = int(raw)
+        return idx - 1 if 1 <= idx <= len(options) else None
+
+    while True:
+        try:
+            choice = _menu()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]bye[/dim]")
+            return
+        if choice in ("0", "q", "quit", "exit"):
+            console.print("[dim]bye[/dim]")
+            return
+        if choice == "1":
+            wi = _pick("window", TIME_WINDOWS, lambda w: w[0])
+            if wi is None:
+                console.print("[dim]  cancelled[/dim]")
+                continue
+            label, secs = TIME_WINDOWS[wi]
+            _render_severity(result, secs, label)
+        elif choice == "2":
+            si = _pick("severity (0=all)", [("ALL", "All")] + SEVERITY_MENU, lambda s: s[1])
+            lvl = None if (si is None or si == 0) else ([("ALL", "")] + SEVERITY_MENU)[si][0]
+            fams = families_in_window(result, level_bucket=lvl, limit=30)
+            _render_families(result, fams, f"Families — {lvl or 'all severities'}")
+        elif choice == "3":
+            q = console.input("[bold cyan]search›[/bold cyan] ").strip()
+            fams = families_in_window(result, query=q, limit=30)
+            _render_families(result, fams, f"Families matching '{q}'")
+        elif choice == "4":
+            lines = result.get("top_lines", [])[:30]
+            if not lines:
+                console.print("[dim]  no lines[/dim]")
+                continue
+            table = Table(title="Top anomaly lines", header_style="bold cyan")
+            table.add_column("Level")
+            table.add_column("Score", justify="right")
+            table.add_column("Message")
+            for a in lines:
+                table.add_row(
+                    str(a.get("level", "")),
+                    f"{float(a.get('score', 0.0)):.2f}",
+                    str(a.get("message", ""))[:90],
+                )
+            console.print(table)
+        else:
+            console.print("[dim]  pick 1-4 or 0 to quit[/dim]")
 
 
 # --------------------------------------------------------------------------- #
@@ -2342,6 +3226,12 @@ def _should_forward(argv: list[str]) -> bool:
 
 
 def main() -> None:
+    """Console-script entry point.
+
+    Eligible commands are forwarded to the warm daemon when it's enabled; if the
+    daemon is down, unreachable, or errors, we fall straight through to running
+    in-process, so behaviour never regresses.
+    """
     argv = sys.argv[1:]
     if _should_forward(argv):
         try:
