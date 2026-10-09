@@ -20,6 +20,65 @@ _SOCK_NAME = "daemon.sock"
 _IS_WINDOWS = os.name == "nt"
 _USE_UNIX = hasattr(socket, "AF_UNIX") and not _IS_WINDOWS
 
+_viable_cache: bool | None = None
+
+
+def _is_wsl() -> bool:
+    try:
+        with open("/proc/version", encoding="utf-8", errors="ignore") as fh:
+            return "microsoft" in fh.read().lower()
+    except OSError:
+        return False
+
+
+def local_ipc_viable() -> bool:
+    global _viable_cache
+    if _viable_cache is not None:
+        return _viable_cache
+    _viable_cache = _probe_bind()
+    return _viable_cache
+
+
+def _probe_bind() -> bool:
+    if _is_wsl():
+        return False
+    try:
+        if _USE_UNIX:
+            probe = os.path.join(_runtime_dir(), f".probe.{os.getpid()}.sock")
+            try:
+                os.remove(probe)
+            except OSError:
+                pass
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.bind(probe)
+                return True
+            except OSError:
+                return False
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                try:
+                    os.remove(probe)
+                except OSError:
+                    pass
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind(("127.0.0.1", 0))
+                return True
+            except OSError:
+                return False
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    except OSError:
+        return False
+
 
 def _runtime_dir() -> str:
 
@@ -68,6 +127,40 @@ def _remove_state() -> None:
             os.remove(p)
         except OSError:
             pass
+
+
+# --- cooldown: if the daemon can't start in this environment (e.g. WSL where
+# the loopback socket is filtered), remember that for a few minutes so every
+# subsequent command runs in-process immediately instead of re-waiting. --------
+_COOLDOWN_NAME = "daemon.nodaemon"
+_COOLDOWN_SECS = 300.0
+
+
+def _cooldown_path() -> str:
+    return os.path.join(_runtime_dir(), _COOLDOWN_NAME)
+
+
+def _in_cooldown() -> bool:
+    try:
+        age = time.time() - os.path.getmtime(_cooldown_path())
+        return age < _COOLDOWN_SECS
+    except OSError:
+        return False
+
+
+def _set_cooldown() -> None:
+    try:
+        with open(_cooldown_path(), "w", encoding="utf-8") as fh:
+            fh.write(str(time.time()))
+    except OSError:
+        pass
+
+
+def _clear_cooldown() -> None:
+    try:
+        os.remove(_cooldown_path())
+    except OSError:
+        pass
 
 
 def _pid_alive(pid: int) -> bool:
@@ -175,9 +268,16 @@ def stop() -> bool:
     return ok
 
 
-def ensure_running(spawn: bool = True, wait: float = 20.0) -> bool:
+def ensure_running(spawn: bool = True, wait: float = 3.0) -> bool:
     if is_running():
+        _clear_cooldown()
         return True
+    # Environment can't host the daemon (e.g. WSL) → don't even try; no stall.
+    if not local_ipc_viable():
+        return False
+    # A recent failed start → don't pay the wait again; run in-process now.
+    if _in_cooldown():
+        return False
     stale = _read_state()
     if stale is not None:
         if stale.get("version") != __version__:
@@ -187,10 +287,17 @@ def ensure_running(spawn: bool = True, wait: float = 20.0) -> bool:
         return False
     _spawn_detached()
     deadline = time.time() + wait
-    while time.time() < deadline:
-        if is_running():
-            return True
-        time.sleep(0.1)
+    try:
+        while time.time() < deadline:
+            if is_running():
+                _clear_cooldown()
+                return True
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        _set_cooldown()
+        return False
+    # Gave the daemon its chance and it didn't answer — remember that.
+    _set_cooldown()
     return False
 
 

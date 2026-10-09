@@ -21,6 +21,7 @@ __all__ = [
     "analyze",
     "analyze_async",
     "analyze_entries",
+    "apply_supervised_head",
     "rca_for_anomalies",
     "ask_about_anomalies",
     "html_for_anomalies",
@@ -133,6 +134,33 @@ def analyze_entries(
     entries = list(entries)
     det = run(entries, config or RunConfig(), baseline=baseline)
     return _wrap(entries, det, fmt)
+
+
+def apply_supervised_head(res: AnalysisResult, model_path: str) -> AnalysisResult:
+
+    from loglens.detection.benchmark import SupervisedHead, build_feature_matrix
+
+    head = SupervisedHead.load(model_path)
+    det = res.detection
+    entries = res.entries
+    scores = np.asarray(det.scores, dtype=float)
+    if len(entries) == 0:
+        return res
+    preds = head.predict(build_feature_matrix(entries, scores))
+    order = np.argsort(-scores, kind="stable")
+    anomalies = [
+        _to_anomaly(entries[i], det.scores[i], det.reasons[i], int(i))
+        for i in order
+        if int(preds[i]) == 1
+    ]
+    return AnalysisResult(
+        anomalies=anomalies,
+        entries=entries,
+        detection=det,
+        incident=res.incident,
+        incident_note=res.incident_note,
+        format=res.format,
+    )
 
 
 def _parse(lines: Iterable[str], fmt: str | None):
